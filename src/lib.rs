@@ -4,18 +4,19 @@ use std::sync::{Arc, RwLock};
 use byteorder::{ByteOrder, BigEndian, ReadBytesExt, WriteBytesExt};
 
 const PAGE_SIZE: usize = 1024;
+const PAGE_RECORD_POINTER_SIZE: usize = 4;
 const MAGIC: u8 = 0xD7;
 
 #[derive(Debug, PartialEq)]
 struct Cursor {
-    pageid: u64,
-    slotid: u16,
+    pageid: u64, // pageid starts from 1
+    slotid: u16, // slotid starts from zero
 }
 
 // In-memory page representation
 struct Page {
-    records: Vec<Vec<u8>>,
-    space_used: usize,
+    pub records: Vec<Vec<u8>>,
+    pub space_used: usize,
 }
 
 impl Page {
@@ -96,42 +97,51 @@ impl DiskQueue {
     }
 }
 
-fn buf_write_page(p: &Page) -> [u8; PAGE_SIZE] {
+fn buf_write_record_page(p: &Page) -> [u8; PAGE_SIZE] {
     let sz = p.records.len();
     let record_top = 1; // After MAGIC
     let offset_top = PAGE_SIZE - 2; // page size - num of records (2 bytes)
 
     // Populate records and offsets buffer
     let mut records_buf: Vec<u8> = vec![];
-    let mut offsets_buf: Vec<u8> = vec![0; sz];
+    let offsets_buf_sz = sz * PAGE_RECORD_POINTER_SIZE;
+    let mut offsets_buf: Vec<u8> = vec![0; offsets_buf_sz];
     for (slot, r) in p.records.iter().enumerate() {
         let record_off = (record_top + records_buf.len()) as u16;
         let record_len = r.len() as u16;
         records_buf.extend(r.iter());
 
-        let off = offset_top - (slot + 1) * 4;
+        let off = offsets_buf_sz - (slot + 1) * PAGE_RECORD_POINTER_SIZE;
         BigEndian::write_u16(&mut offsets_buf[off..], record_off);
         BigEndian::write_u16(&mut offsets_buf[off+2..], record_len);
     }
 
     let mut buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
     buf[0] = MAGIC;
-    buf[1..].clone_from_slice(&records_buf);
+    buf[1..1+records_buf.len()].clone_from_slice(&records_buf);
     let empty_space = PAGE_SIZE - 1 - records_buf.len() - offsets_buf.len() - 2;
     let offset_bot = 1 + records_buf.len() + empty_space;
-    buf[offset_bot..].clone_from_slice(&offsets_buf);
+    buf[offset_bot..offset_bot+offsets_buf_sz].clone_from_slice(&offsets_buf);
     BigEndian::write_u16(&mut buf[offset_top..], sz as u16);
     
     buf
 }
 
-fn buf_read_page(buf: &[u8]) -> Page {
+fn buf_read_record_page(buf: &[u8]) -> Page {
     assert_eq!(buf.len(), PAGE_SIZE);
     assert_eq!(buf[0], MAGIC);
 
     let offset_top = PAGE_SIZE - 2; // page size - num of records (2 bytes)
-    // TODO
-    Page::new()
+    let sz = BigEndian::read_u16(&buf[offset_top..]);
+    let mut page = Page::new();
+    for slot in 0..sz {
+        let off: usize = offset_top - (slot as usize + 1) * PAGE_RECORD_POINTER_SIZE;
+        let record_off = BigEndian::read_u16(&buf[off..]) as usize;
+        let record_len = BigEndian::read_u16(&buf[off+2..]) as usize;
+        let record = buf[record_off..record_off+record_len].to_vec();
+        page.insert(record);
+    }
+    page
 }
 
 fn buf_write_metadata_page(m: &Metadata) -> [u8; PAGE_SIZE] {
@@ -186,7 +196,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_write_and_read_metadata_page() {
+    fn test_buf_write_and_read_metadata_page() {
         let m = Metadata {
             num_pages: 1,
             num_items: 3,
@@ -197,6 +207,31 @@ mod tests {
         let meta = buf_read_metadata_page(&page);
 
         assert_eq!(meta, m);
+    }
+
+    #[test]
+    fn test_buf_write_and_read_record_page() {
+        let records = vec![
+            "https://www.google.com".as_bytes().to_vec(),
+            "https://www.dexcode.com".as_bytes().to_vec(),
+            "https://sahamee.com".as_bytes().to_vec(),
+        ];
+        let mut page = Page::new();
+        for record in records.iter() {
+            assert_eq!(page.can_insert(&record), true);
+            page.insert(record.clone());
+        }
+
+        let buf = buf_write_record_page(&page);
+        let read_page = buf_read_record_page(&buf);
+        assert_eq!(read_page.records.len(), 3);
+        assert_eq!(read_page.records, records);
+
+        let mut records_size = 0;
+        for record in records.iter() {
+            records_size += record.len();
+        }
+        assert_eq!(read_page.space_used, 3 + 3 * 4 + records_size);
     }
 }
 
