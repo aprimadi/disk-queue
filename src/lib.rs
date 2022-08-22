@@ -11,7 +11,7 @@ const PAGE_SIZE: usize = 1024;
 const PAGE_RECORD_POINTER_SIZE: usize = 4;
 const MAGIC: u8 = 0xD7;
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Cursor {
     pageid: u64, // pageid starts from 1
     slotid: u16, // slotid starts from zero
@@ -19,10 +19,10 @@ struct Cursor {
 
 // In-memory meta page representation
 struct MetaPage {
-    pub num_pages: u64,
-    pub num_items: u64,
-    pub read_cursor: Cursor,
-    pub write_cursor: Cursor,
+    num_pages: u64,
+    num_items: u64,
+    read_cursor: Cursor,
+    write_cursor: Cursor,
 
     // Pointer to mmap-ed memory
     mem: *const u8,
@@ -79,24 +79,79 @@ impl MetaPage {
             mem: ptr,
         }
     }
+    
+    pub fn get_num_pages(&self) -> u64 {
+        self.num_pages
+    }
+    
+    pub fn get_num_items(&self) -> u64 {
+        self.num_items
+    }
+    
+    pub fn get_read_cursor(&self) -> Cursor {
+        self.read_cursor.clone()
+    }
+    
+    pub fn get_write_cursor(&self) -> Cursor {
+        self.write_cursor.clone()
+    }
 
     pub fn set_num_pages(&mut self, v: u64) {
         self.num_pages = v;
+        
         unsafe {
-            // TODO
+            let mut buf: [u8; 8] = [0; 8];
+            BigEndian::write_u64(&mut buf, v);
+            let ptr = self.mem.offset(1).cast::<[u8; 8]>() as *mut [u8; 8];
+            std::ptr::write(ptr, buf);
         }
     }
 
     pub fn set_num_items(&mut self, v: u64) {
-        // TODO
+        self.num_items = v;
+        
+        unsafe {
+            let mut buf: [u8; 8] = [0; 8];
+            BigEndian::write_u64(&mut buf, v);
+            let ptr = self.mem.offset(9).cast::<[u8; 8]>() as *mut [u8; 8];
+            std::ptr::write(ptr, buf);
+        }
     }
 
     pub fn set_read_cursor(&mut self, v: Cursor) {
-        // TODO
+        self.read_cursor = v.clone();
+        
+        unsafe {
+            // Write pageid
+            let mut buf: [u8; 8] = [0; 8];
+            BigEndian::write_u64(&mut buf, v.pageid);
+            let ptr = self.mem.offset(17).cast::<[u8; 8]>() as *mut [u8; 8];
+            std::ptr::write(ptr, buf);
+            
+            // Write slotid
+            let mut buf: [u8; 2] = [0; 2];
+            BigEndian::write_u16(&mut buf, v.slotid);
+            let ptr = self.mem.offset(25).cast::<[u8; 2]>() as *mut [u8; 2];
+            std::ptr::write(ptr, buf);
+        }
     }
 
     pub fn set_write_cursor(&mut self, v: Cursor) {
-        // TODO
+        self.write_cursor = v.clone();
+        
+        unsafe {
+            // Write pageid
+            let mut buf: [u8; 8] = [0; 8];
+            BigEndian::write_u64(&mut buf, v.pageid);
+            let ptr = self.mem.offset(27).cast::<[u8; 8]>() as *mut [u8; 8];
+            std::ptr::write(ptr, buf);
+            
+            // Write slotid
+            let mut buf: [u8; 2] = [0; 2];
+            BigEndian::write_u16(&mut buf, v.slotid);
+            let ptr = self.mem.offset(35).cast::<[u8; 2]>() as *mut [u8; 2];
+            std::ptr::write(ptr, buf);
+        }
     }
 }
 
@@ -104,6 +159,8 @@ impl MetaPage {
 struct RecordPage {
     pub records: Vec<Vec<u8>>,
     pub space_used: usize,
+    // Offset for new record, during insert
+    pub write_offset: u16,
 
     // Pointer to mmap-ed memory
     mem: *const u8,
@@ -115,23 +172,91 @@ impl RecordPage {
             records: vec![],
             // magic (1 byte) + num of records (2 bytes)
             space_used: 1 + 2,
+            write_offset: 1,
             mem: ptr::null(),
         }
     }
+    
+    pub fn from_file(file: File, pageid: u64) {
+        // TODO
+    }
 
     pub fn from_mmap_ptr(ptr: *const u8) -> Self {
-        // TODO
+        let mut records = vec![];
+        
+        unsafe {
+            // Read magic
+            let magic = ptr.read();
+            assert_eq!(magic, MAGIC);
+            
+            // Read num records
+            let buf = ptr.offset((PAGE_SIZE - 2) as isize).cast::<[u8; 2]>().read();
+            let num_records = BigEndian::read_u16(&buf) as usize;
+            
+            // Read records
+            for slot in 0..num_records {
+                // Read record pointer
+                let off = (PAGE_SIZE - 2 - (slot + 1) * 4) as isize;
+                let buf = ptr.offset(off).cast::<[u8; 2]>().read();
+                let offset = BigEndian::read_u16(&buf) as isize;
+                let buf = ptr.offset(off+2).cast::<[u8; 2]>().read();
+                let size = BigEndian::read_u16(&buf) as usize;
+                
+                // Read record
+                let buf = std::slice::from_raw_parts(ptr.offset(offset), size);
+                let record = buf.to_vec();
+                records.push(record);
+            }
+        }
+        
+        // Calculate space used and write offset
+        let (space_used, write_offset) = {
+            let mut off = 1;
+            let mut sz = 1 + 2; // magic + num records
+            for record in records.iter() {
+                off += record.len();
+                sz += record.len();
+                sz += 4; // record pointer
+            }
+            (sz, off as u16)
+        };
+        
         Self {
-            records: vec![],
-            space_used: 3,
+            records,
+            space_used,
+            write_offset,
             mem: ptr,
         }
     }
 
     pub fn insert(&mut self, record: Vec<u8>) {
         assert!(self.space_used + self.record_space(&record) <= PAGE_SIZE);
+        assert!(self.mem != ptr::null());
 
+        unsafe {
+            // Write num records
+            let mut buf: [u8; 2] = [0; 2];
+            let space_used = self.space_used as u16;
+            BigEndian::write_u16(&mut buf, space_used);
+            let off = (PAGE_SIZE - 2) as isize;
+            let ptr = self.mem.offset(off).cast::<[u8; 2]>() as *mut [u8; 2];
+            std::ptr::write(ptr, buf);
+            
+            // Write record pointer
+            let mut buf: [u8; 4] = [0; 4];
+            BigEndian::write_u16(&mut buf, self.write_offset);
+            BigEndian::write_u16(&mut buf[2..], record.len() as u16);
+            let off = (PAGE_SIZE - 2 - (self.records.len() + 1) * 4) as isize;
+            let ptr = self.mem.offset(off).cast::<[u8; 4]>() as *mut [u8; 4];
+            std::ptr::write(ptr, buf);
+            
+            // Write record
+            let off = self.write_offset as isize;
+            std::ptr::copy(record.as_ptr(), self.mem.offset(off) as *mut u8, record.len());
+        }
+        
         self.space_used += self.record_space(&record);
+        self.write_offset += record.len() as u16;
         self.records.push(record);
     }
 
@@ -155,18 +280,15 @@ struct Metadata {
 }
 
 pub struct DiskQueue {
-    num_pages: u64,
-    num_items: u64,
-    read_cursor: Cursor,
-    write_cursor: Cursor,
-
+    // TODO: This needs to be protected by latch?
+    file: File,
+    meta_page: Arc<RwLock<MetaPage>>,
     read_page: Arc<RwLock<RecordPage>>,
     write_page: Arc<RwLock<RecordPage>>,
 }
 
 impl DiskQueue {
     pub fn new(path: &str) -> Self {
-        // TODO:
         // Check if file exists, if it doesn't initialize file and close it
         if !Path::new(path).exists() {
             let mut file = File::create(path).unwrap();
@@ -184,13 +306,13 @@ impl DiskQueue {
             file.sync_all().unwrap();
         }
 
-        // - Open the file, mmap-ing the first two pages
+        // Open the file, mmap-ing the first two pages
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .unwrap();
-        let mut mmap = unsafe {
+        let mmap = unsafe {
             MmapOptions::new()
                 .len(2 * PAGE_SIZE)
                 .map_mut(&file)
@@ -201,18 +323,25 @@ impl DiskQueue {
             meta_page_mem.add(PAGE_SIZE)
         };
         
-        let page = Arc::new(RwLock::new(RecordPage::new()));
-        let read_page = page.clone();
-        let write_page = page;
-
-        let read_cursor = Cursor { pageid: 1, slotid: 0 };
-        let write_cursor = Cursor { pageid: 1, slotid: 0 };
+        let meta_page = Arc::new(RwLock::new(MetaPage::from_mmap_ptr(meta_page_mem)));
+        let write_page = Arc::new(RwLock::new(RecordPage::from_mmap_ptr(write_page_mem)));
+        
+        let read_page;
+        {
+            let meta_page = meta_page.write().unwrap();
+            let num_pages = meta_page.get_num_pages();
+            let read_cursor = meta_page.get_read_cursor();
+            if read_cursor.pageid == num_pages {
+                read_page = write_page.clone();
+            } else {
+                // TODO
+                read_page = write_page.clone();
+            }
+        }
 
         Self {
-            num_pages: 1,
-            num_items: 0,
-            read_cursor,
-            write_cursor,
+            file,
+            meta_page,
             read_page,
             write_page,
         }
@@ -365,4 +494,3 @@ mod tests {
         assert_eq!(read_page.space_used, 3 + 3 * 4 + records_size);
     }
 }
-
