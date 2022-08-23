@@ -83,8 +83,13 @@ impl DiskQueue {
             write_page,
         }
     }
+    
+    pub fn num_items(&self) -> u64 {
+        let meta_page = self.meta_page.read().unwrap();
+        meta_page.get_num_items()
+    }
 
-    pub fn enqueue(&self, record: Vec<u8>) {
+    pub fn enqueue(&mut self, record: Vec<u8>) {
         let mut meta_page = self.meta_page.write().unwrap();
         let mut write_page = self.write_page.write().unwrap();
         if write_page.can_insert(&record) {
@@ -95,9 +100,27 @@ impl DiskQueue {
             write_cursor.slotid += 1;
             meta_page.set_write_cursor(write_cursor);
         } else {
-            // TODO
-            // - Copy write page to a new page
-            // - Reset write page
+            // Copy write page to a new page and reset write page
+            let pageid = meta_page.get_num_pages();
+            write_page.save(self.file.clone(), pageid);
+            write_page.reset();
+            
+            let mut write_cursor = meta_page.get_write_cursor();
+            write_cursor.pageid = pageid;
+            write_cursor.slotid = 0;
+            meta_page.incr_num_items();
+            meta_page.incr_num_pages();
+            meta_page.set_write_cursor(write_cursor);
+            
+            // A read page may point to the write page, in which case we need 
+            // to load the newly written page and assign the read page to it.
+            if Arc::ptr_eq(&self.read_page, &self.write_page) {
+                let read_page = RecordPage::from_file(
+                    self.file.clone(),
+                    pageid,
+                );
+                self.read_page = Arc::new(RwLock::new(read_page));
+            }
         }
     }
 

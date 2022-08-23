@@ -1,9 +1,9 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ptr;
 use std::sync::{Arc, Mutex};
 
-use byteorder::{ByteOrder, BigEndian, ReadBytesExt};
+use byteorder::{ByteOrder, BigEndian};
 
 use crate::constant::PAGE_SIZE;
 
@@ -248,12 +248,19 @@ impl RecordPage {
         let mut file = file.lock().unwrap();
         let off = (pageid + 1) * PAGE_SIZE as u64;
         file.seek(SeekFrom::Start(off)).unwrap();
-        let buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
-        // TODO
+        let mut buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+        unsafe {
+            ptr::copy(self.mem, buf.as_mut_ptr(), PAGE_SIZE);
+        }
+        file.write(&buf).unwrap();
     }
     
     pub fn reset(&self) {
-        // TODO
+        let page = RecordPage::new();
+        let buf = buf_write_record_page(&page);
+        unsafe {
+            ptr::copy(buf.as_ptr(), self.mem as *mut u8, PAGE_SIZE);
+        }
     }
     
     pub fn num_records(&self) -> usize {
@@ -289,7 +296,11 @@ impl RecordPage {
             let off = self.write_offset as isize;
             std::ptr::copy(record.as_ptr(), self.mem.offset(off) as *mut u8, record.len());
         }
-        
+
+        self.non_mmap_insert(record);
+    }
+    
+    fn non_mmap_insert(&mut self, record: Vec<u8>) {
         self.space_used += self.record_space(&record);
         self.write_offset += record.len() as u16;
         self.records.push(record);
@@ -357,7 +368,7 @@ fn buf_read_record_page(buf: &[u8]) -> RecordPage {
         let record_off = BigEndian::read_u16(&buf[off..]) as usize;
         let record_len = BigEndian::read_u16(&buf[off+2..]) as usize;
         let record = buf[record_off..record_off+record_len].to_vec();
-        page.records.push(record);
+        page.non_mmap_insert(record);
     }
     page
 }
@@ -372,47 +383,44 @@ pub fn buf_write_metadata_page(m: &Metadata) -> [u8; PAGE_SIZE] {
     buf
 }
 
-fn buf_read_metadata_page(buf: &[u8]) -> Metadata {
-    assert_eq!(buf.len(), PAGE_SIZE);
-    
-    let mut rdr = std::io::Cursor::new(buf);
-    let magic = rdr.read_u8().unwrap();
-    assert_eq!(magic, MAGIC);
-    let num_pages = rdr.read_u64::<BigEndian>().unwrap();
-    let num_items = rdr.read_u64::<BigEndian>().unwrap();
-    let read_cursor_pageid = rdr.read_u64::<BigEndian>().unwrap();
-    let read_cursor_slotid = rdr.read_u16::<BigEndian>().unwrap();
-    let write_cursor_pageid = rdr.read_u64::<BigEndian>().unwrap();
-    let write_cursor_slotid = rdr.read_u16::<BigEndian>().unwrap();
-
-    Metadata {
-        num_pages,
-        num_items,
-        read_cursor: Cursor { 
-            pageid: read_cursor_pageid, 
-            slotid: read_cursor_slotid,
-        },
-        write_cursor: Cursor { 
-            pageid: write_cursor_pageid, 
-            slotid: write_cursor_slotid,
-        },
-    }
-}
-
 fn write_cursor(buf: &mut [u8], cursor: &Cursor) {
     BigEndian::write_u64(buf, cursor.pageid);
     BigEndian::write_u16(&mut buf[8..], cursor.slotid);
 }
 
-fn read_cursor(buf: &[u8]) -> Cursor {
-    // TODO
-    Cursor { pageid: 0, slotid: 0 }
-}
-
 #[cfg(test)]
 mod tests {
+    use byteorder::ReadBytesExt;
+    
     use super::*;
 
+    fn buf_read_metadata_page(buf: &[u8]) -> Metadata {
+        assert_eq!(buf.len(), PAGE_SIZE);
+        
+        let mut rdr = std::io::Cursor::new(buf);
+        let magic = rdr.read_u8().unwrap();
+        assert_eq!(magic, MAGIC);
+        let num_pages = rdr.read_u64::<BigEndian>().unwrap();
+        let num_items = rdr.read_u64::<BigEndian>().unwrap();
+        let read_cursor_pageid = rdr.read_u64::<BigEndian>().unwrap();
+        let read_cursor_slotid = rdr.read_u16::<BigEndian>().unwrap();
+        let write_cursor_pageid = rdr.read_u64::<BigEndian>().unwrap();
+        let write_cursor_slotid = rdr.read_u16::<BigEndian>().unwrap();
+    
+        Metadata {
+            num_pages,
+            num_items,
+            read_cursor: Cursor { 
+                pageid: read_cursor_pageid, 
+                slotid: read_cursor_slotid,
+            },
+            write_cursor: Cursor { 
+                pageid: write_cursor_pageid, 
+                slotid: write_cursor_slotid,
+            },
+        }
+    }
+    
     #[test]
     fn test_buf_write_and_read_metadata_page() {
         let m = Metadata {
@@ -437,7 +445,7 @@ mod tests {
         let mut page = RecordPage::new();
         for record in records.iter() {
             assert_eq!(page.can_insert(&record), true);
-            page.records.push(record.clone());
+            page.non_mmap_insert(record.clone());
         }
 
         let buf = buf_write_record_page(&page);
@@ -450,6 +458,6 @@ mod tests {
             records_size += record.len();
         }
         assert_eq!(read_page.space_used, 3 + 3 * 4 + records_size);
-        // TODO: Test write offset
+        assert_eq!(read_page.write_offset, (1 + records_size) as u16);
     }
 }
