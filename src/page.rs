@@ -244,6 +244,18 @@ impl RecordPage {
         }
     }
     
+    pub fn save(&self, file: Arc<Mutex<File>>, pageid: u64) {
+        let mut file = file.lock().unwrap();
+        let off = (pageid + 1) * PAGE_SIZE as u64;
+        file.seek(SeekFrom::Start(off)).unwrap();
+        let buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+        // TODO
+    }
+    
+    pub fn reset(&self) {
+        // TODO
+    }
+    
     pub fn num_records(&self) -> usize {
         self.records.len()
     }

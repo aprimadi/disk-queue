@@ -101,30 +101,52 @@ impl DiskQueue {
         }
     }
 
-    pub fn dequeue(&self) -> Option<Vec<u8>> {
+    pub fn dequeue(&mut self) -> Option<Vec<u8>> {
         let mut meta_page = self.meta_page.write().unwrap();
-        let read_page = self.read_page.read().unwrap();
         
-        let num_pages = meta_page.get_num_pages();
-        let num_records = read_page.num_records();
-        let mut read_cursor = meta_page.get_read_cursor();
-        let write_cursor = meta_page.get_write_cursor();
-        
-        if read_cursor == write_cursor {
-            return None;
+        let mut assign_write_to_read_page = false;
+        let mut read_next_page = false;
+        let mut read_cursor;
+        let record;
+        {
+            let read_page = self.read_page.read().unwrap();
+            
+            let num_pages = meta_page.get_num_pages();
+            let num_records = read_page.num_records();
+            read_cursor = meta_page.get_read_cursor();
+            let write_cursor = meta_page.get_write_cursor();
+            
+            if read_cursor == write_cursor {
+                return None;
+            }
+            
+            record = read_page.get_record(read_cursor.slotid as usize);
+            if read_cursor.slotid + 1 < num_records as u16 {
+                read_cursor.slotid += 1;
+                meta_page.set_read_cursor(read_cursor.clone());
+            } else {
+                read_cursor.pageid += 1;
+                read_cursor.slotid = 0;
+                meta_page.set_read_cursor(read_cursor.clone());
+                
+                assert!(read_cursor.pageid <= num_pages);
+                if read_cursor.pageid == num_pages {
+                    assign_write_to_read_page = true;
+                } else {
+                    read_next_page = true;
+                }
+            }
         }
         
-        let record = read_page.get_record(read_cursor.slotid as usize);
-        if read_cursor.slotid + 1 < num_records as u16 {
-            read_cursor.slotid += 1;
-            meta_page.set_read_cursor(read_cursor);
-        } else {
-            read_cursor.pageid += 1;
-            read_cursor.slotid = 0;
-            meta_page.set_read_cursor(read_cursor.clone());
-            
-            // TODO: Read the next page
-            assert!(read_cursor.pageid <= num_pages);
+        if assign_write_to_read_page {
+            self.read_page = self.write_page.clone();
+        }
+        if read_next_page {
+            let mut read_page = self.read_page.write().unwrap();
+            *read_page = RecordPage::from_file(
+                self.file.clone(),
+                read_cursor.pageid,
+            );
         }
         
         Some(record)
