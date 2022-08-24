@@ -255,12 +255,16 @@ impl RecordPage {
         file.write(&buf).unwrap();
     }
     
-    pub fn reset(&self) {
+    pub fn reset(&mut self) {
         let page = RecordPage::new();
         let buf = buf_write_record_page(&page);
         unsafe {
             ptr::copy(buf.as_ptr(), self.mem as *mut u8, PAGE_SIZE);
         }
+
+        self.records = vec![];
+        self.space_used = 3;
+        self.write_offset = 1;
     }
     
     pub fn num_records(&self) -> usize {
@@ -278,8 +282,8 @@ impl RecordPage {
         unsafe {
             // Write num records
             let mut buf: [u8; 2] = [0; 2];
-            let space_used = self.space_used as u16;
-            BigEndian::write_u16(&mut buf, space_used);
+            let num_records = (self.records.len() + 1) as u16;
+            BigEndian::write_u16(&mut buf, num_records);
             let off = (PAGE_SIZE - 2) as isize;
             let ptr = self.mem.offset(off).cast::<[u8; 2]>() as *mut [u8; 2];
             std::ptr::write(ptr, buf);
@@ -294,10 +298,14 @@ impl RecordPage {
             
             // Write record
             let off = self.write_offset as isize;
-            std::ptr::copy(record.as_ptr(), self.mem.offset(off) as *mut u8, record.len());
+            std::ptr::copy(
+                record.as_ptr(), 
+                self.mem.offset(off) as *mut u8, 
+                record.len()
+            );
         }
 
-        self.non_mmap_insert(record);
+        self.non_mmap_insert(record.clone());
     }
     
     fn non_mmap_insert(&mut self, record: Vec<u8>) {
@@ -367,6 +375,11 @@ fn buf_read_record_page(buf: &[u8]) -> RecordPage {
         let off: usize = offset_top - (slot as usize + 1) * PAGE_RECORD_POINTER_SIZE;
         let record_off = BigEndian::read_u16(&buf[off..]) as usize;
         let record_len = BigEndian::read_u16(&buf[off+2..]) as usize;
+        if record_off >= PAGE_SIZE || record_off + record_len >= PAGE_SIZE {
+            println!("slot: {}", slot);
+            println!("record_off: {}", record_off);
+            println!("record_len: {}", record_len);
+        }
         let record = buf[record_off..record_off+record_len].to_vec();
         page.non_mmap_insert(record);
     }

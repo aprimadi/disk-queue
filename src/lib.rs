@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
-use memmap::MmapOptions;
+use memmap::{MmapMut, MmapOptions};
 
 mod constant;
 mod page;
@@ -20,6 +20,7 @@ pub struct DiskQueue {
     meta_page: Arc<RwLock<MetaPage>>,
     read_page: Arc<RwLock<RecordPage>>,
     write_page: Arc<RwLock<RecordPage>>,
+    _mmap: MmapMut,
 }
 
 impl DiskQueue {
@@ -56,8 +57,6 @@ impl DiskQueue {
                 .unwrap()
         };
         
-        println!("black magic success");
-        
         let meta_page_mem = mmap.as_ptr();
         let write_page_mem = unsafe {
             meta_page_mem.add(PAGE_SIZE)
@@ -86,6 +85,7 @@ impl DiskQueue {
             meta_page,
             read_page,
             write_page,
+            _mmap: mmap,
         }
     }
     
@@ -111,8 +111,11 @@ impl DiskQueue {
             write_page.reset();
             
             let mut write_cursor = meta_page.get_write_cursor();
-            write_cursor.pageid = pageid;
+            write_cursor.pageid = pageid + 1;
             write_cursor.slotid = 0;
+
+            write_page.insert(record);
+
             meta_page.incr_num_items();
             meta_page.incr_num_pages();
             meta_page.set_write_cursor(write_cursor);
@@ -149,7 +152,8 @@ impl DiskQueue {
             }
             
             record = read_page.get_record(read_cursor.slotid as usize);
-            if read_cursor.slotid + 1 < num_records as u16 {
+            if read_cursor.slotid + 1 < num_records as u16 || 
+               read_cursor.pageid == write_cursor.pageid {
                 read_cursor.slotid += 1;
                 meta_page.set_read_cursor(read_cursor.clone());
             } else {
@@ -183,38 +187,99 @@ impl DiskQueue {
 
 #[cfg(test)]
 mod tests {
+    use rand::RngCore;
+
     use super::*;
+
+    fn cleanup_test_db() {
+        std::fs::remove_file("test.db").unwrap();
+    }
 
     #[test]
     fn test_basic() {
-        let records = vec![
-            "https://www.google.com".as_bytes().to_vec(),
-            "https://www.dexcode.com".as_bytes().to_vec(),
-            "https://sahamee.com".as_bytes().to_vec(),
-        ];
+        {
+            let records = vec![
+                "https://www.google.com".as_bytes().to_vec(),
+                "https://www.dexcode.com".as_bytes().to_vec(),
+                "https://sahamee.com".as_bytes().to_vec(),
+            ];
         
-        println!("kepanggil");
-        let mut queue = DiskQueue::new("test.db");
-        for record in records.iter() {
-            queue.enqueue(record.clone());
+            let mut queue = DiskQueue::new("test.db");
+            for record in records.iter() {
+                queue.enqueue(record.clone());
+            }
+
+            let mut popped_records = vec![];
+            loop {
+                match queue.dequeue() {
+                    Some(record) => popped_records.push(record),
+                    None => break,
+                }
+            }
+            
+            assert_eq!(records, popped_records);
         }
 
-        /*
-        let mut popped_records = vec![];
-        loop {
-            match queue.dequeue() {
-                Some(record) => popped_records.push(record),
-                None => break,
-            }
-        }
-        
-        assert_eq!(records, popped_records);
-        */
+        cleanup_test_db();
     }
     
     #[test]
     fn test_multiple_pages() {
-        // TODO
+        {
+            let mut records = vec![];
+            for i in 0..10000 {
+                let s = format!("record_{}", i);
+                records.push(s.as_bytes().to_vec());
+            }
+
+            let mut popped_records = vec![];
+
+            let mut queue = DiskQueue::new("test.db");
+
+            let mut enqueue_finished = false;
+            let mut dequeue_finished = false;
+            let mut rng = rand::thread_rng();
+            let mut records_iter = records.iter();
+            // Enqueue & dequeue with ratio 3:1
+            loop {
+                let num = rng.next_u32() & 3; // num = rand % 4
+                match num {
+                    0 => {
+                        // Dequeue
+                        match queue.dequeue() {
+                            Some(r) => popped_records.push(r),
+                            None => {
+                                if enqueue_finished {
+                                    dequeue_finished = true;
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // Enqueue
+                        match records_iter.next() {
+                            Some(r) => queue.enqueue(r.clone()),
+                            None => enqueue_finished = true,
+                        }
+                    }
+                }
+
+                if enqueue_finished && dequeue_finished {
+                    break;
+                }
+            }
+
+            for (idx, record) in records.iter().enumerate() {
+                let empty_vec = vec![];
+                let popped_record = popped_records.get(idx).unwrap_or(&empty_vec);
+                assert_eq!(
+                    String::from_utf8_lossy(record), 
+                    String::from_utf8_lossy(popped_record)
+                );
+            }
+        }
+
+        cleanup_test_db();
     }
     
     #[test]
@@ -222,3 +287,4 @@ mod tests {
         // TODO
     }
 }
+
