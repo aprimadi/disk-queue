@@ -1,1 +1,1 @@
-pub const PAGE_SIZE: usize = 1024;
+pub const PAGE_SIZE: usize = 4096;

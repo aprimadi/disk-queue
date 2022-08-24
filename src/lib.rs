@@ -36,11 +36,13 @@ impl DiskQueue {
             let meta_page_buf = buf_write_metadata_page(&meta);
             let page = RecordPage::new();
             let write_page_buf = buf_write_record_page(&page);
+            assert_eq!(meta_page_buf.len(), PAGE_SIZE);
+            assert_eq!(write_page_buf.len(), PAGE_SIZE);
             file.write(&meta_page_buf).unwrap();
             file.write(&write_page_buf).unwrap();
             file.sync_all().unwrap();
         }
-
+        
         // Open the file, mmap-ing the first two pages
         let file = OpenOptions::new()
             .read(true)
@@ -53,6 +55,9 @@ impl DiskQueue {
                 .map_mut(&file)
                 .unwrap()
         };
+        
+        println!("black magic success");
+        
         let meta_page_mem = mmap.as_ptr();
         let write_page_mem = unsafe {
             meta_page_mem.add(PAGE_SIZE)
@@ -173,5 +178,47 @@ impl DiskQueue {
         }
         
         Some(record)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic() {
+        let records = vec![
+            "https://www.google.com".as_bytes().to_vec(),
+            "https://www.dexcode.com".as_bytes().to_vec(),
+            "https://sahamee.com".as_bytes().to_vec(),
+        ];
+        
+        println!("kepanggil");
+        let mut queue = DiskQueue::new("test.db");
+        for record in records.iter() {
+            queue.enqueue(record.clone());
+        }
+
+        /*
+        let mut popped_records = vec![];
+        loop {
+            match queue.dequeue() {
+                Some(record) => popped_records.push(record),
+                None => break,
+            }
+        }
+        
+        assert_eq!(records, popped_records);
+        */
+    }
+    
+    #[test]
+    fn test_multiple_pages() {
+        // TODO
+    }
+    
+    #[test]
+    fn test_read_plenty() {
+        // TODO
     }
 }
