@@ -375,11 +375,6 @@ fn buf_read_record_page(buf: &[u8]) -> RecordPage {
         let off: usize = offset_top - (slot as usize + 1) * PAGE_RECORD_POINTER_SIZE;
         let record_off = BigEndian::read_u16(&buf[off..]) as usize;
         let record_len = BigEndian::read_u16(&buf[off+2..]) as usize;
-        if record_off >= PAGE_SIZE || record_off + record_len >= PAGE_SIZE {
-            println!("slot: {}", slot);
-            println!("record_off: {}", record_off);
-            println!("record_len: {}", record_len);
-        }
         let record = buf[record_off..record_off+record_len].to_vec();
         page.non_mmap_insert(record);
     }

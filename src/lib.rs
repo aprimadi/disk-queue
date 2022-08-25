@@ -111,13 +111,28 @@ impl DiskQueue {
             
             write_page.insert(record);
 
+            let mut write_cursor = meta_page.get_write_cursor();
+            let mut read_cursor = meta_page.get_read_cursor();
+            
+            // A read page may point to the write page, in which case we need 
+            // to load the newly written page and assign the read page to it.
+            // 
+            // If read_cursor == write_cursor, read_page should still point to
+            // write_page
+            if Arc::ptr_eq(&self.read_page, &self.write_page) && 
+               read_cursor != write_cursor {
+                let read_page = RecordPage::from_file(
+                    self.file.clone(),
+                    pageid,
+                );
+                self.read_page = Arc::new(RwLock::new(read_page));
+            }
+
             // Note that slotid is 1 since we just inserted a new record on 
             // the newly inserted page
             //
             // Also, we need to fix read cursor to point to a new page if it 
             // points to the same cursor as write cursor
-            let mut write_cursor = meta_page.get_write_cursor();
-            let mut read_cursor = meta_page.get_read_cursor();
             if read_cursor == write_cursor {
                 read_cursor.pageid += 1;
                 read_cursor.slotid = 0;
@@ -129,16 +144,6 @@ impl DiskQueue {
             meta_page.incr_num_items();
             meta_page.incr_num_pages();
             meta_page.set_write_cursor(write_cursor);
-            
-            // A read page may point to the write page, in which case we need 
-            // to load the newly written page and assign the read page to it.
-            if Arc::ptr_eq(&self.read_page, &self.write_page) {
-                let read_page = RecordPage::from_file(
-                    self.file.clone(),
-                    pageid,
-                );
-                self.read_page = Arc::new(RwLock::new(read_page));
-            }
         }
     }
 
@@ -163,14 +168,8 @@ impl DiskQueue {
             
             match read_page.get_record(read_cursor.slotid as usize) {
                 Some(r) => record = r,
-                None => {
-                    println!("read_cursor: {:?}", read_cursor);
-                    println!("write_cursor: {:?}", write_cursor);
-                    panic!("Invariant violated");
-                }
+                None => panic!("Invariant violated"),
             }
-            println!("read_cursor: {:?}", read_cursor);
-            println!("write_cursor: {:?}", write_cursor);
             if read_cursor.slotid + 1 < num_records as u16 || 
                read_cursor.pageid == write_cursor.pageid {
                 read_cursor.slotid += 1;
@@ -192,7 +191,6 @@ impl DiskQueue {
         if assign_write_to_read_page {
             self.read_page = self.write_page.clone();
         }
-        // TODO: There could be a problem with this
         if read_next_page {
             let mut read_page = self.read_page.write().unwrap();
             *read_page = RecordPage::from_file(
@@ -279,7 +277,6 @@ mod tests {
                     // Dequeue
                     match queue.dequeue() {
                         Some(r) => {
-                            println!("{}", String::from_utf8_lossy(&r));
                             popped_records.push(r)
                         }
                         None => {
@@ -323,7 +320,7 @@ mod tests {
     #[test]
     // Test reading & writing a lot of pages with read-write ratio of 3:1
     fn read_plenty() {
-        test_read_write_single_threaded(1000, 3, 1);
+        test_read_write_single_threaded(10000, 3, 1);
     }
 }
 
