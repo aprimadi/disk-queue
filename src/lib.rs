@@ -192,8 +192,16 @@ mod tests {
 
     use super::*;
 
+    const TEST_DB_PATH: &str = "test.db";
+
     fn cleanup_test_db() {
-        std::fs::remove_file("test.db").unwrap();
+        loop {
+            std::fs::remove_file(TEST_DB_PATH).unwrap();
+            if !Path::new(TEST_DB_PATH).exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     #[test]
@@ -205,7 +213,7 @@ mod tests {
                 "https://sahamee.com".as_bytes().to_vec(),
             ];
         
-            let mut queue = DiskQueue::new("test.db");
+            let mut queue = DiskQueue::new(TEST_DB_PATH);
             for record in records.iter() {
                 queue.enqueue(record.clone());
             }
@@ -235,7 +243,7 @@ mod tests {
 
             let mut popped_records = vec![];
 
-            let mut queue = DiskQueue::new("test.db");
+            let mut queue = DiskQueue::new(TEST_DB_PATH);
 
             let mut enqueue_finished = false;
             let mut dequeue_finished = false;
