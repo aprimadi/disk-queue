@@ -15,7 +15,6 @@ use page::{
 };
 
 pub struct DiskQueue {
-    // TODO: This needs to be protected by latch?
     file: Arc<Mutex<File>>,
     meta_page: Arc<RwLock<MetaPage>>,
     read_page: Arc<RwLock<RecordPage>>,
@@ -110,11 +109,13 @@ impl DiskQueue {
             write_page.save(self.file.clone(), pageid);
             write_page.reset();
             
+            write_page.insert(record);
+
+            // Note that slotid is 1 since we just inserted a new record on 
+            // the newly inserted page
             let mut write_cursor = meta_page.get_write_cursor();
             write_cursor.pageid = pageid + 1;
-            write_cursor.slotid = 0;
-
-            write_page.insert(record);
+            write_cursor.slotid = 1;
 
             meta_page.incr_num_items();
             meta_page.incr_num_pages();
