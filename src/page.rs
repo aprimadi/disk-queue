@@ -271,8 +271,8 @@ impl RecordPage {
         self.records.len()
     }
     
-    pub fn get_record(&self, slot: usize) -> Vec<u8> {
-        self.records.get(slot).unwrap().clone()
+    pub fn get_record(&self, slot: usize) -> Option<Vec<u8>> {
+        self.records.get(slot).map(|x| x.clone())
     }
 
     pub fn insert(&mut self, record: Vec<u8>) {
