@@ -17,7 +17,7 @@ fn cleanup_benchmark_db() {
 }
 
 fn read(c: &mut Criterion) {
-    let disk_queue = DiskQueue::new(BENCHMARK_DB_PATH);
+    let disk_queue = DiskQueue::open(BENCHMARK_DB_PATH);
 
     let record = "record".as_bytes().to_vec();
     for _ in 0..(1000 *1000 * 100) {
