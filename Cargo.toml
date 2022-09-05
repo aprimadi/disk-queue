@@ -3,6 +3,11 @@ name = "disk-queue"
 version = "0.1.0"
 edition = "2021"
 authors = ["Armin Primadi <aprimadi@gmail.com>"]
+keywords = ["disk-queue", "queue"]
+description = "FIFO queue backed by disk"
+homepage = "https://github.com/aprimadi/disk-queue"
+repository = "https://github.com/aprimadi/disk-queue"
+license = "MIT"
 
 [dependencies]
 memmap = "0.7"
