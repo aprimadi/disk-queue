@@ -7,7 +7,7 @@ FIFO queue backed by disk.
 ```rust
 use disk_queue::DiskQueue;
 
-let mut queue = DiskQueue::new("test.db");
+let mut queue = DiskQueue::open("test.db");
 queue.enqueue("https://sahamee.com".as_bytes().to_vec());
 let item = queue.dequeue().unwrap();
 let s = std::str::from_utf8(&item).unwrap();
