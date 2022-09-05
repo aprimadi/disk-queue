@@ -22,17 +22,21 @@ pub struct MetaPage {
     write_cursor: Cursor,
 
     // Pointer to mmap-ed memory
-    mem: *const u8,
+    //
+    // This is cast to usize so it can be sent safely between threads. Real 
+    // type is `*const u8`
+    mem: usize,
 }
 
 impl MetaPage {
-    pub fn from_mmap_ptr(ptr: *const u8) -> Self {
+    pub fn from_mmap_ptr(ptr: usize) -> Self {
         let num_pages: u64;
         let num_items: u64;
         let read_cursor: Cursor;
         let write_cursor: Cursor;
         unsafe {
             let mut offset = 0;
+            let ptr = ptr as *const u8;
 
             // Read magic
             let magic = ptr.read();
@@ -101,7 +105,8 @@ impl MetaPage {
         self.num_pages = v;
         
         unsafe {
-            (self.mem.offset(1) as *mut u64).write(v);
+            let ptr = self.mem as *const u8;
+            (ptr.offset(1) as *mut u64).write(v);
         }
     }
 
@@ -109,7 +114,8 @@ impl MetaPage {
         self.num_items = v;
         
         unsafe {
-            (self.mem.offset(9) as *mut u64).write(v);
+            let ptr = self.mem as *const u8;
+            (ptr.offset(9) as *mut u64).write(v);
         }
     }
 
@@ -118,8 +124,9 @@ impl MetaPage {
         
         unsafe {
             // Write pageid and slotid
-            (self.mem.offset(17) as *mut u64).write(v.pageid);
-            (self.mem.offset(25) as *mut u16).write(v.slotid);
+            let ptr = self.mem as *const u8;
+            (ptr.offset(17) as *mut u64).write(v.pageid);
+            (ptr.offset(25) as *mut u16).write(v.slotid);
         }
     }
 
@@ -127,8 +134,9 @@ impl MetaPage {
         self.write_cursor = v.clone();
         
         unsafe {
-            (self.mem.offset(27) as *mut u64).write(v.pageid);
-            (self.mem.offset(35) as *mut u16).write(v.slotid);
+            let ptr = self.mem as *const u8;
+            (ptr.offset(27) as *mut u64).write(v.pageid);
+            (ptr.offset(35) as *mut u16).write(v.slotid);
         }
     }
 }
@@ -146,8 +154,10 @@ pub struct RecordPage {
 
     // This protects reading/writing from mem
     rwlatch: Arc<RwLock<()>>,
-    // Pointer to mmap-ed memory
-    mem: *const u8,
+    // Pointer to mmap-ed memory, cast to usize to be able to sent between 
+    // threads, real type is `*const u8`. This is ok because the pointer is
+    // never changed.
+    mem: usize,
 }
 
 impl RecordPage {
@@ -159,7 +169,7 @@ impl RecordPage {
             space_used: 1 + 2,
             write_offset: 1,
             rwlatch: Arc::new(RwLock::new(())),
-            mem: ptr::null(),
+            mem: 0,
         }
     }
     
@@ -173,13 +183,15 @@ impl RecordPage {
         page
     }
 
-    pub fn from_mmap_ptr(rwlatch: Arc<RwLock<()>>, ptr: *const u8) -> Self {
+    pub fn from_mmap_ptr(rwlatch: Arc<RwLock<()>>, ptr: usize) -> Self {
         let mut space_used = 3;
         let mut write_offset = 1;
 
         unsafe {
             // Acquires read latch for reading from ptr
             let _ = rwlatch.read().unwrap();
+
+            let ptr = ptr as *const u8;
 
             // Read magic
             let magic = ptr.read();
@@ -218,7 +230,8 @@ impl RecordPage {
         file.seek(SeekFrom::Start(off)).unwrap();
         let mut buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
         unsafe {
-            ptr::copy(self.mem, buf.as_mut_ptr(), PAGE_SIZE);
+            let _ = self.rwlatch.read().unwrap();
+            ptr::copy(self.mem as *const u8, buf.as_mut_ptr(), PAGE_SIZE);
         }
         file.write(&buf).unwrap();
     }
@@ -241,7 +254,8 @@ impl RecordPage {
             // Read num records
             unsafe {
                 let _ = self.rwlatch.read().unwrap();
-                num_records = self.mem
+                let ptr = self.mem as *const u8;
+                num_records = ptr
                     .offset((PAGE_SIZE - 2) as isize)
                     .cast::<u16>()
                     .read() as usize;
@@ -253,15 +267,15 @@ impl RecordPage {
     }
     
     pub fn get_record(&self, slot: usize) -> Option<Vec<u8>> {
-        println!("slot: {}", slot);
         if self.shared_mem {
             let record;
             unsafe {
                 // Acquires read latch
                 let _ = self.rwlatch.read().unwrap();
+                let ptr = self.mem as *const u8;
 
                 // Read num records
-                let num_records = self.mem.offset((PAGE_SIZE - 2) as isize)
+                let num_records = ptr.offset((PAGE_SIZE - 2) as isize)
                     .cast::<u16>()
                     .read() as usize;
 
@@ -269,11 +283,11 @@ impl RecordPage {
 
                 // Read offset, size
                 let off = (PAGE_SIZE - 2 - (slot + 1) * 4) as isize;
-                let offset = self.mem.offset(off).cast::<u16>().read() as isize;
-                let size = self.mem.offset(off+2).cast::<u16>().read() as usize;
+                let offset = ptr.offset(off).cast::<u16>().read() as isize;
+                let size = ptr.offset(off+2).cast::<u16>().read() as usize;
 
                 // Read record
-                let buf = std::slice::from_raw_parts(self.mem.offset(offset), size);
+                let buf = std::slice::from_raw_parts(ptr.offset(offset), size);
                 record = buf.to_vec();
             }
             Some(record)
@@ -287,31 +301,32 @@ impl RecordPage {
         assert!(self.shared_mem);
 
         unsafe {
-            assert!(self.mem != ptr::null());
+            assert!(self.mem != 0);
 
             // Acquires write latch
             let _ = self.rwlatch.write().unwrap();
+            let ptr = self.mem as *const u8;
 
             // Write num records
             let off = (PAGE_SIZE - 2) as isize;
-            let num_records = self.mem.offset(off)
+            let num_records = ptr.offset(off)
                 .cast::<u16>()
                 .read();
-            (self.mem.offset(off).cast::<u16>() as *mut u16)
+            (ptr.offset(off).cast::<u16>() as *mut u16)
                 .write(num_records + 1);
 
             // Write record pointer
             let off = (PAGE_SIZE - 2 - (num_records as usize + 1) * 4) as isize;
-            (self.mem.offset(off).cast::<u16>() as *mut u16)
+            (ptr.offset(off).cast::<u16>() as *mut u16)
                 .write(self.write_offset);
-            (self.mem.offset(off+2).cast::<u16>() as *mut u16)
+            (ptr.offset(off+2).cast::<u16>() as *mut u16)
                 .write(record.len() as u16);
 
             // Write record
             let off = self.write_offset as isize;
             std::ptr::copy(
                 record.as_ptr(), 
-                self.mem.offset(off) as *mut u8, 
+                ptr.offset(off) as *mut u8, 
                 record.len()
             );
         }

@@ -21,7 +21,9 @@ pub struct DiskQueue {
     write_page: Arc<RwLock<RecordPage>>,
     // This protects reading/writing from write_page_mem
     rwlatch: Arc<RwLock<()>>,
-    write_page_mem: *const u8,
+    // Cast to usize so it can be sent safely between threads
+    // Real type is `*const u8`
+    write_page_mem: usize,
     _mmap: MmapMut,
 }
 
@@ -58,10 +60,10 @@ impl DiskQueue {
                 .unwrap()
         };
         
-        let meta_page_mem = mmap.as_ptr();
+        let meta_page_mem = mmap.as_ptr() as usize;
         let write_page_mem = unsafe {
-            meta_page_mem.add(PAGE_SIZE)
-        };
+            mmap.as_ptr().add(PAGE_SIZE)
+        } as usize;
         let file = Arc::new(Mutex::new(file));
 
         let rwlatch = Arc::new(RwLock::new(()));
@@ -220,7 +222,7 @@ impl DiskQueue {
             let mut read_page = self.read_page.write().unwrap();
             *read_page = RecordPage::from_mmap_ptr(
                 self.rwlatch.clone(), 
-                self.write_page_mem.clone()
+                self.write_page_mem,
             );
         } else if read_next_page {
             let mut read_page = self.read_page.write().unwrap();
@@ -237,7 +239,8 @@ impl DiskQueue {
 #[cfg(test)]
 mod tests {
     use rand::RngCore;
-
+    use std::sync::Condvar;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use super::*;
 
     const TEST_DB_PATH: &str = "test.db";
@@ -352,6 +355,115 @@ mod tests {
     // Test reading & writing a lot of pages with read-write ratio of 3:1
     fn read_plenty() {
         test_read_write_single_threaded(10000, 3, 1);
+    }
+
+    #[test]
+    fn mt() {
+        let done_writing_mut = Arc::new(Mutex::new(false));
+
+        let read_count = Arc::new(AtomicU32::new(0));
+
+        let write_ready_mutex = Arc::new(Mutex::new(0));
+        let write_ready_cond = Arc::new(Condvar::new());
+
+        let disk_queue = Arc::new(DiskQueue::new(TEST_DB_PATH));
+
+        // Spawn 8 read threads
+        let mut read_handles = vec![];
+        for _ in 0..8 {
+            let dq = disk_queue.clone();
+            let write_ready_mutex = write_ready_mutex.clone();
+            let write_ready_cond = write_ready_cond.clone();
+            let done_writing_mut = done_writing_mut.clone();
+            let read_count = read_count.clone();
+            let h = std::thread::spawn(move || {
+                {
+                    let mut write_ready = write_ready_mutex.lock().unwrap();
+                    while *write_ready < 8 {
+                        write_ready = write_ready_cond.wait(write_ready).unwrap();
+                    }
+                }
+
+                // TODO: Read threads is busy looping when there are no items
+                // Perhaps use condition variable to wake up read thread?
+                loop {
+                    if let Some(_) = dq.dequeue() {
+                        read_count.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        let done_writing = done_writing_mut.lock().unwrap();
+                        if *done_writing {
+                            break;
+                        }
+                    }
+                }
+            });
+            read_handles.push(h);
+        }
+
+        // Spawn 8 write threads
+        let mut write_handles = vec![];
+        for tid in 0..8 {
+            let dq = disk_queue.clone();
+            let write_ready_mutex = write_ready_mutex.clone();
+            let write_ready_cond = write_ready_cond.clone();
+            let h = std::thread::spawn(move || {
+                // Generate records
+                let mut records = vec![];
+                for i in 0..1000 {
+                    let s = format!("record_t{}_{}", tid, i);
+                    records.push(s.as_bytes().to_vec());
+                }
+
+                // Increment write ready
+                {
+                    let mut write_ready = write_ready_mutex.lock().unwrap();
+                    *write_ready += 1;
+                    if *write_ready >= 8 {
+                        println!("All threads started");
+                        write_ready_cond.notify_all();
+                    } else {
+                        while *write_ready < 8 {
+                            write_ready = write_ready_cond
+                                .wait(write_ready).unwrap();
+                        }
+                    }
+                }
+
+                println!("Write thread {} start enqueue-ing items", tid);
+
+                // Start enqueue-ing items
+                for record in records {
+                    dq.enqueue(record);
+                }
+
+                println!("Write thread {} done", tid);
+            });
+            write_handles.push(h);
+        }
+
+        // Wait for all write threads to be ready
+        {
+            let mut write_ready = write_ready_mutex.lock().unwrap();
+            while *write_ready < 8 {
+                write_ready = write_ready_cond.wait(write_ready).unwrap();
+            }
+        }
+
+        // Wait for write threads to finish and set done_writing
+        for h in write_handles {
+            h.join().unwrap();
+        }
+        {
+            let mut done_writing = done_writing_mut.lock().unwrap();
+            *done_writing = true;
+        }
+
+        // Wait for all read threads to finish
+        for h in read_handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(read_count.fetch_add(0, Ordering::Relaxed), 8000);
     }
 }
 
