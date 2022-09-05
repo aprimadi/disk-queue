@@ -5,7 +5,6 @@ edition = "2021"
 authors = ["Armin Primadi <aprimadi@gmail.com>"]
 
 [dependencies]
-byteorder = "1.4"
 memmap = "0.7"
 
 [dev-dependencies]

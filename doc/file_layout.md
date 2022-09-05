@@ -57,13 +57,13 @@ that write page is actually page N (the tail page).
 |---------------------------|
 | Empty space               |
 |---------------------------|
-| Offset, size N (4 bytes)  |
+| Offset, size N  (4 bytes) |
 |---------------------------|
 | ...                       |
 |---------------------------|
-| Offset, size 1 (4 bytes)  |
+| Offset, size 1  (4 bytes) |
 |---------------------------|
-| Num of records (2 bytes)  |
+| Num of records  (2 bytes) |
 +---------------------------+
 
 ```

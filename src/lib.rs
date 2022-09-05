@@ -10,7 +10,7 @@ mod page;
 
 use constant::PAGE_SIZE;
 use page::{
-    buf_write_metadata_page, buf_write_record_page,
+    buf_write_metadata_page, empty_page_buf,
     Cursor, Metadata, MetaPage, RecordPage
 };
 
@@ -19,6 +19,9 @@ pub struct DiskQueue {
     meta_page: Arc<RwLock<MetaPage>>,
     read_page: Arc<RwLock<RecordPage>>,
     write_page: Arc<RwLock<RecordPage>>,
+    // This protects reading/writing from write_page_mem
+    rwlatch: Arc<RwLock<()>>,
+    write_page_mem: *const u8,
     _mmap: MmapMut,
 }
 
@@ -34,8 +37,7 @@ impl DiskQueue {
                 write_cursor: Cursor { pageid: 1, slotid: 0 },
             };
             let meta_page_buf = buf_write_metadata_page(&meta);
-            let page = RecordPage::new();
-            let write_page_buf = buf_write_record_page(&page);
+            let write_page_buf = empty_page_buf();
             assert_eq!(meta_page_buf.len(), PAGE_SIZE);
             assert_eq!(write_page_buf.len(), PAGE_SIZE);
             file.write(&meta_page_buf).unwrap();
@@ -61,9 +63,13 @@ impl DiskQueue {
             meta_page_mem.add(PAGE_SIZE)
         };
         let file = Arc::new(Mutex::new(file));
+
+        let rwlatch = Arc::new(RwLock::new(()));
         
         let meta_page = Arc::new(RwLock::new(MetaPage::from_mmap_ptr(meta_page_mem)));
-        let write_page = Arc::new(RwLock::new(RecordPage::from_mmap_ptr(write_page_mem)));
+        let write_page = Arc::new(RwLock::new(
+            RecordPage::from_mmap_ptr(rwlatch.clone(), write_page_mem))
+        );
         
         let read_page;
         {
@@ -71,7 +77,9 @@ impl DiskQueue {
             let num_pages = meta_page.get_num_pages();
             let read_cursor = meta_page.get_read_cursor();
             if read_cursor.pageid == num_pages {
-                read_page = write_page.clone();
+                read_page = Arc::new(RwLock::new(
+                    RecordPage::from_mmap_ptr(rwlatch.clone(), write_page_mem)
+                ));
             } else {
                 read_page = Arc::new(RwLock::new(
                     RecordPage::from_file(file.clone(), read_cursor.pageid)
@@ -84,6 +92,8 @@ impl DiskQueue {
             meta_page,
             read_page,
             write_page,
+            write_page_mem,
+            rwlatch,
             _mmap: mmap,
         }
     }
@@ -93,10 +103,12 @@ impl DiskQueue {
         meta_page.get_num_items()
     }
 
-    pub fn enqueue(&mut self, record: Vec<u8>) {
+    pub fn enqueue(&self, record: Vec<u8>) {
         let mut meta_page = self.meta_page.write().unwrap();
         let mut write_page = self.write_page.write().unwrap();
         if write_page.can_insert(&record) {
+            // Case 1: the write page can still hold the record
+
             write_page.insert(record);
             
             meta_page.incr_num_items();
@@ -104,6 +116,10 @@ impl DiskQueue {
             write_cursor.slotid += 1;
             meta_page.set_write_cursor(write_cursor);
         } else {
+            // Case 2: the write page cannot hold the new record
+            //
+            // This should write the page to disk and reset the write page
+            
             // Copy write page to a new page and reset write page
             let pageid = meta_page.get_num_pages();
             write_page.save(self.file.clone(), pageid);
@@ -114,18 +130,30 @@ impl DiskQueue {
             let mut write_cursor = meta_page.get_write_cursor();
             let mut read_cursor = meta_page.get_read_cursor();
             
-            // A read page may point to the write page, in which case we need 
-            // to load the newly written page and assign the read page to it.
-            // 
-            // If read_cursor == write_cursor, read_page should still point to
-            // write_page
-            if Arc::ptr_eq(&self.read_page, &self.write_page) && 
-               read_cursor != write_cursor {
-                let read_page = RecordPage::from_file(
-                    self.file.clone(),
-                    pageid,
-                );
-                self.read_page = Arc::new(RwLock::new(read_page));
+            // There are two cases here:
+            // 1. Read page points to the write page (i.e. it shares the same 
+            //    underlying memory)
+            // 2. Read page points to a read-only page from disk.
+            //
+            // In case 2, we don't have to do anything.
+            //
+            // In case 1, we further need to determine if read_cursor is 
+            // equal to write_cursor. 
+            // If it is, then the read page should still point to write page. 
+            // Nothing should be done.
+            // If it is not, we need to load read_page from a recently written 
+            // page.
+            {
+                let mut read_page = self.read_page.write().unwrap();
+                if read_page.is_shared_mem() && 
+                   read_cursor != write_cursor 
+                {
+                    let rp = RecordPage::from_file(
+                        self.file.clone(),
+                        pageid,
+                    );
+                    *read_page = rp;
+                }
             }
 
             // Note that slotid is 1 since we just inserted a new record on 
@@ -147,7 +175,7 @@ impl DiskQueue {
         }
     }
 
-    pub fn dequeue(&mut self) -> Option<Vec<u8>> {
+    pub fn dequeue(&self) -> Option<Vec<u8>> {
         let mut meta_page = self.meta_page.write().unwrap();
         
         let mut assign_write_to_read_page = false;
@@ -189,9 +217,12 @@ impl DiskQueue {
         }
         
         if assign_write_to_read_page {
-            self.read_page = self.write_page.clone();
-        }
-        if read_next_page {
+            let mut read_page = self.read_page.write().unwrap();
+            *read_page = RecordPage::from_mmap_ptr(
+                self.rwlatch.clone(), 
+                self.write_page_mem.clone()
+            );
+        } else if read_next_page {
             let mut read_page = self.read_page.write().unwrap();
             *read_page = RecordPage::from_file(
                 self.file.clone(),
@@ -230,7 +261,7 @@ mod tests {
                 "https://sahamee.com".as_bytes().to_vec(),
             ];
         
-            let mut queue = DiskQueue::new(TEST_DB_PATH);
+            let queue = DiskQueue::new(TEST_DB_PATH);
             for record in records.iter() {
                 queue.enqueue(record.clone());
             }
@@ -265,7 +296,7 @@ mod tests {
 
             let mut popped_records = vec![];
 
-            let mut queue = DiskQueue::new(TEST_DB_PATH);
+            let queue = DiskQueue::new(TEST_DB_PATH);
 
             let mut enqueue_finished = false;
             let mut dequeue_finished = false;

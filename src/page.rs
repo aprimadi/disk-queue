@@ -1,13 +1,11 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ptr;
-use std::sync::{Arc, Mutex};
-
-use byteorder::{ByteOrder, BigEndian};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::constant::PAGE_SIZE;
 
-const PAGE_RECORD_POINTER_SIZE: usize = 4;
+const RECPTR_SZ: usize = 4;
 const MAGIC: u8 = 0xD7;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,30 +40,24 @@ impl MetaPage {
             offset += 1;
 
             // Read num_pages
-            let buf = ptr.offset(offset).cast::<[u8; 8]>().read();
-            num_pages = BigEndian::read_u64(&buf);
+            num_pages = ptr.offset(offset).cast::<u64>().read();
             offset += 8;
 
             // Read num items
-            let buf = ptr.offset(offset).cast::<[u8; 8]>().read();
-            num_items = BigEndian::read_u64(&buf);
+            num_items = ptr.offset(offset).cast::<u64>().read();
             offset += 8;
 
             // Read read_cursor
-            let buf = ptr.offset(offset).cast::<[u8; 8]>().read();
-            let pageid = BigEndian::read_u64(&buf);
+            let pageid = ptr.offset(offset).cast::<u64>().read();
             offset += 8;
-            let buf = ptr.offset(offset).cast::<[u8; 2]>().read();
-            let slotid = BigEndian::read_u16(&buf);
+            let slotid = ptr.offset(offset).cast::<u16>().read();
             offset += 2;
             read_cursor = Cursor { pageid, slotid };
 
             // Read write_cursor
-            let buf = ptr.offset(offset).cast::<[u8; 8]>().read();
-            let pageid = BigEndian::read_u64(&buf);
+            let pageid = ptr.offset(offset).cast::<u64>().read();
             offset += 8;
-            let buf = ptr.offset(offset).cast::<[u8; 2]>().read();
-            let slotid = BigEndian::read_u16(&buf);
+            let slotid = ptr.offset(offset).cast::<u16>().read();
             //offset += 2;
             write_cursor = Cursor { pageid, slotid };
         }
@@ -109,10 +101,7 @@ impl MetaPage {
         self.num_pages = v;
         
         unsafe {
-            let mut buf: [u8; 8] = [0; 8];
-            BigEndian::write_u64(&mut buf, v);
-            let ptr = self.mem.offset(1).cast::<[u8; 8]>() as *mut [u8; 8];
-            std::ptr::write(ptr, buf);
+            (self.mem.offset(1) as *mut u64).write(v);
         }
     }
 
@@ -120,10 +109,7 @@ impl MetaPage {
         self.num_items = v;
         
         unsafe {
-            let mut buf: [u8; 8] = [0; 8];
-            BigEndian::write_u64(&mut buf, v);
-            let ptr = self.mem.offset(9).cast::<[u8; 8]>() as *mut [u8; 8];
-            std::ptr::write(ptr, buf);
+            (self.mem.offset(9) as *mut u64).write(v);
         }
     }
 
@@ -131,17 +117,9 @@ impl MetaPage {
         self.read_cursor = v.clone();
         
         unsafe {
-            // Write pageid
-            let mut buf: [u8; 8] = [0; 8];
-            BigEndian::write_u64(&mut buf, v.pageid);
-            let ptr = self.mem.offset(17).cast::<[u8; 8]>() as *mut [u8; 8];
-            std::ptr::write(ptr, buf);
-            
-            // Write slotid
-            let mut buf: [u8; 2] = [0; 2];
-            BigEndian::write_u16(&mut buf, v.slotid);
-            let ptr = self.mem.offset(25).cast::<[u8; 2]>() as *mut [u8; 2];
-            std::ptr::write(ptr, buf);
+            // Write pageid and slotid
+            (self.mem.offset(17) as *mut u64).write(v.pageid);
+            (self.mem.offset(25) as *mut u16).write(v.slotid);
         }
     }
 
@@ -149,28 +127,25 @@ impl MetaPage {
         self.write_cursor = v.clone();
         
         unsafe {
-            // Write pageid
-            let mut buf: [u8; 8] = [0; 8];
-            BigEndian::write_u64(&mut buf, v.pageid);
-            let ptr = self.mem.offset(27).cast::<[u8; 8]>() as *mut [u8; 8];
-            std::ptr::write(ptr, buf);
-            
-            // Write slotid
-            let mut buf: [u8; 2] = [0; 2];
-            BigEndian::write_u16(&mut buf, v.slotid);
-            let ptr = self.mem.offset(35).cast::<[u8; 2]>() as *mut [u8; 2];
-            std::ptr::write(ptr, buf);
+            (self.mem.offset(27) as *mut u64).write(v.pageid);
+            (self.mem.offset(35) as *mut u16).write(v.slotid);
         }
     }
 }
 
 // In-memory record page representation
 pub struct RecordPage {
+    // Whether the record page is loaded from shared memory
+    shared_mem: bool,
+    
+    // These fields aren't used when the page is loaded from shared memory.
     records: Vec<Vec<u8>>,
-    space_used: usize,
+    space_used: u16,
     // Offset for new record, during insert
     write_offset: u16,
 
+    // This protects reading/writing from mem
+    rwlatch: Arc<RwLock<()>>,
     // Pointer to mmap-ed memory
     mem: *const u8,
 }
@@ -178,10 +153,12 @@ pub struct RecordPage {
 impl RecordPage {
     pub fn new() -> Self {
         Self {
+            shared_mem: false,
             records: vec![],
             // magic (1 byte) + num of records (2 bytes)
             space_used: 1 + 2,
             write_offset: 1,
+            rwlatch: Arc::new(RwLock::new(())),
             mem: ptr::null(),
         }
     }
@@ -196,50 +173,41 @@ impl RecordPage {
         page
     }
 
-    pub fn from_mmap_ptr(ptr: *const u8) -> Self {
-        let mut records = vec![];
-        
+    pub fn from_mmap_ptr(rwlatch: Arc<RwLock<()>>, ptr: *const u8) -> Self {
+        let mut space_used = 3;
+        let mut write_offset = 1;
+
         unsafe {
+            // Acquires read latch for reading from ptr
+            let _ = rwlatch.read().unwrap();
+
             // Read magic
             let magic = ptr.read();
             assert_eq!(magic, MAGIC);
-            
+
             // Read num records
-            let buf = ptr.offset((PAGE_SIZE - 2) as isize).cast::<[u8; 2]>().read();
-            let num_records = BigEndian::read_u16(&buf) as usize;
-            
-            // Read records
-            for slot in 0..num_records {
-                // Read record pointer
-                let off = (PAGE_SIZE - 2 - (slot + 1) * 4) as isize;
-                let buf = ptr.offset(off).cast::<[u8; 2]>().read();
-                let offset = BigEndian::read_u16(&buf) as isize;
-                let buf = ptr.offset(off+2).cast::<[u8; 2]>().read();
-                let size = BigEndian::read_u16(&buf) as usize;
-                
-                // Read record
-                let buf = std::slice::from_raw_parts(ptr.offset(offset), size);
-                let record = buf.to_vec();
-                records.push(record);
+            let nrecords = ptr
+                .offset((PAGE_SIZE - 2) as isize)
+                .cast::<u16>()
+                .read();
+
+            // Populate space used and write offset
+            let recptr_sz = RECPTR_SZ as isize;
+            let mut off = (PAGE_SIZE - 2) as isize;
+            for _ in 0..nrecords {
+                off -= recptr_sz;
+                let rec_len = ptr.offset(off+2).cast::<u16>().read();
+                space_used += rec_len + 4;
+                write_offset += rec_len;
             }
         }
         
-        // Calculate space used and write offset
-        let (space_used, write_offset) = {
-            let mut off = 1;
-            let mut sz = 1 + 2; // magic + num records
-            for record in records.iter() {
-                off += record.len();
-                sz += record.len();
-                sz += 4; // record pointer
-            }
-            (sz, off as u16)
-        };
-        
         Self {
-            records,
+            shared_mem: true,
+            records: vec![], // Unused
             space_used,
             write_offset,
+            rwlatch,
             mem: ptr,
         }
     }
@@ -256,46 +224,89 @@ impl RecordPage {
     }
     
     pub fn reset(&mut self) {
-        let page = RecordPage::new();
-        let buf = buf_write_record_page(&page);
+        let buf = empty_page_buf();
         unsafe {
+            let _ = self.rwlatch.write().unwrap();
             ptr::copy(buf.as_ptr(), self.mem as *mut u8, PAGE_SIZE);
         }
 
-        self.records = vec![];
         self.space_used = 3;
         self.write_offset = 1;
     }
     
     pub fn num_records(&self) -> usize {
-        self.records.len()
+        if self.shared_mem {
+            let num_records;
+
+            // Read num records
+            unsafe {
+                let _ = self.rwlatch.read().unwrap();
+                num_records = self.mem
+                    .offset((PAGE_SIZE - 2) as isize)
+                    .cast::<u16>()
+                    .read() as usize;
+            }
+            num_records
+        } else {
+            self.records.len()
+        }
     }
     
     pub fn get_record(&self, slot: usize) -> Option<Vec<u8>> {
-        self.records.get(slot).map(|x| x.clone())
+        println!("slot: {}", slot);
+        if self.shared_mem {
+            let record;
+            unsafe {
+                // Acquires read latch
+                let _ = self.rwlatch.read().unwrap();
+
+                // Read num records
+                let num_records = self.mem.offset((PAGE_SIZE - 2) as isize)
+                    .cast::<u16>()
+                    .read() as usize;
+
+                assert!(slot < num_records);
+
+                // Read offset, size
+                let off = (PAGE_SIZE - 2 - (slot + 1) * 4) as isize;
+                let offset = self.mem.offset(off).cast::<u16>().read() as isize;
+                let size = self.mem.offset(off+2).cast::<u16>().read() as usize;
+
+                // Read record
+                let buf = std::slice::from_raw_parts(self.mem.offset(offset), size);
+                record = buf.to_vec();
+            }
+            Some(record)
+        } else {
+            self.records.get(slot).map(|x| x.clone())
+        }
     }
 
     pub fn insert(&mut self, record: Vec<u8>) {
-        assert!(self.space_used + self.record_space(&record) <= PAGE_SIZE);
-        assert!(self.mem != ptr::null());
+        assert!(self.space_used + self.record_space(&record) <= PAGE_SIZE as u16);
+        assert!(self.shared_mem);
 
         unsafe {
+            assert!(self.mem != ptr::null());
+
+            // Acquires write latch
+            let _ = self.rwlatch.write().unwrap();
+
             // Write num records
-            let mut buf: [u8; 2] = [0; 2];
-            let num_records = (self.records.len() + 1) as u16;
-            BigEndian::write_u16(&mut buf, num_records);
             let off = (PAGE_SIZE - 2) as isize;
-            let ptr = self.mem.offset(off).cast::<[u8; 2]>() as *mut [u8; 2];
-            std::ptr::write(ptr, buf);
-            
+            let num_records = self.mem.offset(off)
+                .cast::<u16>()
+                .read();
+            (self.mem.offset(off).cast::<u16>() as *mut u16)
+                .write(num_records + 1);
+
             // Write record pointer
-            let mut buf: [u8; 4] = [0; 4];
-            BigEndian::write_u16(&mut buf, self.write_offset);
-            BigEndian::write_u16(&mut buf[2..], record.len() as u16);
-            let off = (PAGE_SIZE - 2 - (self.records.len() + 1) * 4) as isize;
-            let ptr = self.mem.offset(off).cast::<[u8; 4]>() as *mut [u8; 4];
-            std::ptr::write(ptr, buf);
-            
+            let off = (PAGE_SIZE - 2 - (num_records as usize + 1) * 4) as isize;
+            (self.mem.offset(off).cast::<u16>() as *mut u16)
+                .write(self.write_offset);
+            (self.mem.offset(off+2).cast::<u16>() as *mut u16)
+                .write(record.len() as u16);
+
             // Write record
             let off = self.write_offset as isize;
             std::ptr::copy(
@@ -307,20 +318,24 @@ impl RecordPage {
 
         self.non_mmap_insert(record.clone());
     }
+
+    pub fn is_shared_mem(&self) -> bool {
+        self.shared_mem
+    }
     
     fn non_mmap_insert(&mut self, record: Vec<u8>) {
         self.space_used += self.record_space(&record);
         self.write_offset += record.len() as u16;
-        self.records.push(record);
     }
 
     pub fn can_insert(&self, record: &Vec<u8>) -> bool {
-        self.space_used + self.record_space(&record) <= PAGE_SIZE
+        assert_eq!(self.shared_mem, true);
+        self.space_used + self.record_space(&record) <= PAGE_SIZE as u16
     }
 
     #[inline(always)]
-    fn record_space(&self, record: &Vec<u8>) -> usize {
-        record.len() + 4 // the data and offset to the data
+    fn record_space(&self, record: &Vec<u8>) -> u16 {
+        record.len() as u16 + 4 // the data and offset to the data
     }
 }
 
@@ -334,6 +349,13 @@ pub struct Metadata {
 }
 
 
+pub fn empty_page_buf() -> [u8; PAGE_SIZE] {
+    let mut buf = [0; PAGE_SIZE];
+    buf[0] = MAGIC;
+    buf
+}
+
+/*
 pub fn buf_write_record_page(p: &RecordPage) -> [u8; PAGE_SIZE] {
     let sz = p.records.len();
     let record_top = 1; // After MAGIC
@@ -363,20 +385,28 @@ pub fn buf_write_record_page(p: &RecordPage) -> [u8; PAGE_SIZE] {
     
     buf
 }
+*/
 
 fn buf_read_record_page(buf: &[u8]) -> RecordPage {
     assert_eq!(buf.len(), PAGE_SIZE);
     assert_eq!(buf[0], MAGIC);
 
-    let offset_top = PAGE_SIZE - 2; // page size - num of records (2 bytes)
-    let sz = BigEndian::read_u16(&buf[offset_top..]);
-    let mut page = RecordPage::new();
-    for slot in 0..sz {
-        let off: usize = offset_top - (slot as usize + 1) * PAGE_RECORD_POINTER_SIZE;
-        let record_off = BigEndian::read_u16(&buf[off..]) as usize;
-        let record_len = BigEndian::read_u16(&buf[off+2..]) as usize;
-        let record = buf[record_off..record_off+record_len].to_vec();
-        page.non_mmap_insert(record);
+    let ptr: *const u8 = buf.as_ptr();
+
+    let offset_top = (PAGE_SIZE - 2) as isize; // page size - num of records (2 bytes)
+    let mut page;
+    unsafe {
+        let sz = ptr.offset(offset_top).cast::<u16>().read();
+        page = RecordPage::new();
+        for slot in 0..sz {
+            let off: isize = offset_top - (slot as isize + 1) * RECPTR_SZ as isize;
+            let record_off = ptr.offset(off).cast::<u16>().read() as usize;
+            let record_len = ptr.offset(off+2).cast::<u16>().read() as usize;
+            let record = buf[record_off..record_off+record_len].to_vec();
+            page.space_used += page.record_space(&record);
+            page.write_offset += record.len() as u16;
+            page.records.push(record);
+        }
     }
     page
 }
@@ -384,88 +414,15 @@ fn buf_read_record_page(buf: &[u8]) -> RecordPage {
 pub fn buf_write_metadata_page(m: &Metadata) -> [u8; PAGE_SIZE] {
     let mut buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
     buf[0] = MAGIC;
-    BigEndian::write_u64(&mut buf[1..], m.num_pages);
-    BigEndian::write_u64(&mut buf[9..], m.num_items);
-    write_cursor(&mut buf[17..], &m.read_cursor);
-    write_cursor(&mut buf[27..], &m.write_cursor);
+    let ptr: *mut u8 = buf.as_mut_ptr();
+    unsafe {
+        ptr.offset(1).cast::<u64>().write(m.num_pages);
+        ptr.offset(9).cast::<u64>().write(m.num_items);
+        ptr.offset(17).cast::<u64>().write(m.read_cursor.pageid);
+        ptr.offset(25).cast::<u16>().write(m.read_cursor.slotid);
+        ptr.offset(27).cast::<u64>().write(m.write_cursor.pageid);
+        ptr.offset(35).cast::<u16>().write(m.write_cursor.slotid);
+    }
     buf
 }
 
-fn write_cursor(buf: &mut [u8], cursor: &Cursor) {
-    BigEndian::write_u64(buf, cursor.pageid);
-    BigEndian::write_u16(&mut buf[8..], cursor.slotid);
-}
-
-#[cfg(test)]
-mod tests {
-    use byteorder::ReadBytesExt;
-    
-    use super::*;
-
-    fn buf_read_metadata_page(buf: &[u8]) -> Metadata {
-        assert_eq!(buf.len(), PAGE_SIZE);
-        
-        let mut rdr = std::io::Cursor::new(buf);
-        let magic = rdr.read_u8().unwrap();
-        assert_eq!(magic, MAGIC);
-        let num_pages = rdr.read_u64::<BigEndian>().unwrap();
-        let num_items = rdr.read_u64::<BigEndian>().unwrap();
-        let read_cursor_pageid = rdr.read_u64::<BigEndian>().unwrap();
-        let read_cursor_slotid = rdr.read_u16::<BigEndian>().unwrap();
-        let write_cursor_pageid = rdr.read_u64::<BigEndian>().unwrap();
-        let write_cursor_slotid = rdr.read_u16::<BigEndian>().unwrap();
-    
-        Metadata {
-            num_pages,
-            num_items,
-            read_cursor: Cursor { 
-                pageid: read_cursor_pageid, 
-                slotid: read_cursor_slotid,
-            },
-            write_cursor: Cursor { 
-                pageid: write_cursor_pageid, 
-                slotid: write_cursor_slotid,
-            },
-        }
-    }
-    
-    #[test]
-    fn test_buf_write_and_read_metadata_page() {
-        let m = Metadata {
-            num_pages: 1,
-            num_items: 3,
-            read_cursor: Cursor { pageid: 1, slotid: 2 },
-            write_cursor: Cursor { pageid: 1, slotid: 3 },
-        };
-        let page = buf_write_metadata_page(&m);
-        let meta = buf_read_metadata_page(&page);
-
-        assert_eq!(meta, m);
-    }
-
-    #[test]
-    fn test_buf_write_and_read_record_page() {
-        let records = vec![
-            "https://www.google.com".as_bytes().to_vec(),
-            "https://www.dexcode.com".as_bytes().to_vec(),
-            "https://sahamee.com".as_bytes().to_vec(),
-        ];
-        let mut page = RecordPage::new();
-        for record in records.iter() {
-            assert_eq!(page.can_insert(&record), true);
-            page.non_mmap_insert(record.clone());
-        }
-
-        let buf = buf_write_record_page(&page);
-        let read_page = buf_read_record_page(&buf);
-        assert_eq!(read_page.records.len(), 3);
-        assert_eq!(read_page.records, records);
-
-        let mut records_size = 0;
-        for record in records.iter() {
-            records_size += record.len();
-        }
-        assert_eq!(read_page.space_used, 3 + 3 * 4 + records_size);
-        assert_eq!(read_page.write_offset, (1 + records_size) as u16);
-    }
-}
