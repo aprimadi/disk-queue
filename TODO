@@ -3,6 +3,6 @@ TODO
 
 [x] Ditch byteorder and use native memory representation for fast memory copy
 [x] DiskQueue should be interior mutable
-[ ] Write benchmarks
+[x] Write benchmarks
 [ ] Test single threaded with channel design and test performance
 

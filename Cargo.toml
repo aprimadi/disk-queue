@@ -8,5 +8,14 @@ authors = ["Armin Primadi <aprimadi@gmail.com>"]
 memmap = "0.7"
 
 [dev-dependencies]
+criterion = "0.3"
 rand = "0.8"
+
+[[bench]]
+name = "write"
+harness = false
+
+[[bench]]
+name = "read"
+harness = false
 

@@ -358,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn mt() {
+    fn multithreaded() {
         let done_writing_mut = Arc::new(Mutex::new(false));
 
         let read_count = Arc::new(AtomicU32::new(0));
